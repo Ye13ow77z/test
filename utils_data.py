@@ -23,7 +23,8 @@ def get_adj_normalized(adj):
     
     return torch.FloatTensor(adj_normalized.toarray())
 
-def load_graph_data(dataset_name, path='./DCRN/dataset/', use_pca=True, pca_dim=50, device='cpu'):
+
+def load_graph_data(dataset_name, path='./DCRN/dataset/', use_pca=False, pca_dim=50, device='cpu'):
     """
     通用数据加载函数
     Args:
@@ -109,3 +110,5 @@ def load_graph_data(dataset_name, path='./DCRN/dataset/', use_pca=True, pca_dim=
     print(f"Data Loaded: Nodes={feat.shape[0]}, Features={feat.shape[1]}, Classes={len(torch.unique(label))}")
     
     return adj_norm, feat, label, adj_dense_tensor
+
+

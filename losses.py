@@ -24,3 +24,11 @@ def reconstruction_loss(x, x_recon):
 
 def adagcl_reg_loss(denoise_weights):
     return torch.mean(denoise_weights)
+
+# === 新增以下函数 ===
+def vgae_kl_loss(mu, logstd):
+    """
+    计算 VGAE 的 KL 散度 Loss:
+    KL(q(z|x) || p(z)) = -0.5 * sum(1 + 2*logstd - mu^2 - exp(2*logstd))
+    """
+    return -0.5 / mu.size(0) * torch.mean(torch.sum(1 + 2 * logstd - mu.pow(2) - (2 * logstd).exp(), dim=1))
