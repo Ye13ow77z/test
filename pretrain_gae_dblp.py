@@ -15,7 +15,7 @@ def normalize_adj(adj):
     adj_normalized = adj_.dot(degree_mat_inv_sqrt).transpose().dot(degree_mat_inv_sqrt).tocoo()
     return torch.FloatTensor(adj_normalized.toarray())
 
-# === 2. 关键修改：定义一个长得像 AdaGCL 的 GAE ===
+# === 2. GAE ===
 class GAE_AdaGCL_Style(nn.Module):
     def __init__(self, n_input, n_hidden, n_z):
         super(GAE_AdaGCL_Style, self).__init__()
@@ -91,7 +91,7 @@ if __name__ == "__main__":
         if epoch % 10 == 0:
             print(f"Epoch {epoch}: Loss {loss.item():.4f}")
 
-    # 保存权重 (注意文件名改了)
+    # 保存权重
     save_path = f'./DCRN/model_pretrain/{dataset}_adagcl_pretrain.pkl'
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     torch.save(model.state_dict(), save_path)

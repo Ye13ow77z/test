@@ -41,8 +41,8 @@ class Args:
         self.epochs = 200
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        # Loss 权重 (根据建议调整了 Recon 和 En-CLU 的比例)
-        self.lambda_recon = 0.5   # 降低一点重构权重
+        # Loss 权重 
+        self.lambda_recon = 0.5   
         self.lambda_kl_cluster = 1.0  
         self.lambda_vgae = 0.5        
         self.lambda_en_clu = 1.5  # 提高 En-CLU 权重，强调对比
@@ -77,7 +77,7 @@ def vgae_kl_loss(mu, logstd):
     return -0.5 / mu.size(0) * torch.mean(torch.sum(1 + 2 * logstd - mu.pow(2) - (2 * logstd).exp(), dim=1))
 
 # ====================================================================
-# 核心修正：智能权重加载 (适配新模型结构)
+# 智能权重加载 
 # ====================================================================
 def load_gae_to_vgae(model, pretrain_path, device):
     if pretrain_path is None or not os.path.exists(pretrain_path):
@@ -118,9 +118,6 @@ def load_gae_to_vgae(model, pretrain_path, device):
     new_state_dict = {}
     
     matched_count = 0
-
-    # 打印一下预训练文件的键名，方便调试（可选）
-    # print("Pretrain Keys:", list(pretrained_dict.keys())[:5])
 
     for k, v in pretrained_dict.items():
         # === 1. 匹配 Backbone (Input -> Hidden) ===

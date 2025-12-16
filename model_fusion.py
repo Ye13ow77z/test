@@ -9,7 +9,7 @@ import math
 # ====================================================================
 # 0. 适配层 (Global Args Proxy)
 # ====================================================================
-# 为了不修改 AdaGCL 源码中的 args.x 调用，我们在这里定义一个全局代理
+# 不修改 AdaGCL 源码中的 args.x 调用，定义一个全局代理
 class GlobalArgs:
     def __init__(self):
         self.user = 0
@@ -249,7 +249,7 @@ class AdaDCRN_VGAE(nn.Module):
         self.view_gen = vgae(self.encoder_vgae, self.decoder_vgae)
         
         # 2. 去噪视图 (AdaGCL DenoisingNet)
-        # 注意：这里我们用 hidden_dim 作为内部维度
+        # 这里用 hidden_dim 作为内部维度
         self.view_den = DenoisingNet(input_dim, hidden_dim)
         
         # 3. 融合层
@@ -275,8 +275,7 @@ class AdaDCRN_VGAE(nn.Module):
         l0_loss = self.view_den.l0_norm(self.view_den.edge_weights[0])
         
         # 3. 编码去噪图
-        # 我们复用 view_gen 的 encoder (Shared Encoder 策略)，这在 AdaGCL 中是常见的
-        # 也可以单独定义一个 encoder。这里复用能减少参数并对齐空间。
+        # 复用 view_gen 的 encoder (Shared Encoder 策略)
         z_den, _, _ = self.view_gen.encoder(x, adj_den)
         
         # C. 融合 (Fusion)
