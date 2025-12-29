@@ -8,7 +8,7 @@ import sys
 
 # === 0. 路径配置 ===
 sys.path.append(os.getcwd()) 
-
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from sklearn.cluster import KMeans
 from sklearn.metrics import normalized_mutual_info_score, adjusted_rand_score, f1_score, accuracy_score
 from scipy.optimize import linear_sum_assignment 
@@ -76,101 +76,22 @@ def target_distribution(q):
 def vgae_kl_loss(mu, logstd):
     return -0.5 / mu.size(0) * torch.mean(torch.sum(1 + 2 * logstd - mu.pow(2) - (2 * logstd).exp(), dim=1))
 
-# ====================================================================
-# 智能权重加载 
-# ====================================================================
-def load_gae_to_vgae(model, pretrain_path, device):
-    if pretrain_path is None or not os.path.exists(pretrain_path):
-        print(f"!! Warning: Pretrain path {pretrain_path} not found. Using Random Init.")
-        return
 
-    print(f"Loading GAE weights from {pretrain_path}...")
-    pretrained_dict = torch.load(pretrain_path, map_location=device)
-    model_dict = model.state_dict()
-    new_state_dict = {}
-    
-    matched_count = 0
-
-    # === 手动映射表 ===
-    # Key: 预训练文件中的键名 (GAE)
-    # Value: 新模型中的键名列表 (AdaDCRN_VGAE)
-    
-    # 1. 第一层 (Input -> Hidden)
-    # 预训练: gcn1.weight / bias
-    # 新模型: 
-    #   - view_gen.encoder_vgae.gcn_shared (生成视图编码器)
-    #   - view_den.nblayers_0.0 (去噪视图的邻居变换)
-    #   - view_den.selflayers_0.0 (去噪视图的自身变换)
-    
-    # 2. 第二层 (Hidden -> Z)
-    # 预训练: gcn2.weight / bias
-    # 新模型:
-    #   - view_gen.encoder_vgae.encoder_mean.0 (均值映射的第一层 Linear)
-    
-def load_gae_to_vgae(model, pretrain_path, device):
-    if pretrain_path is None or not os.path.exists(pretrain_path):
-        print(f"!! Warning: Pretrain path {pretrain_path} not found. Using Random Init.")
-        return
-
-    print(f"Loading GAE weights from {pretrain_path}...")
-    pretrained_dict = torch.load(pretrain_path, map_location=device)
-    model_dict = model.state_dict()
-    new_state_dict = {}
-    
-    matched_count = 0
-
-    for k, v in pretrained_dict.items():
-        # === 1. 匹配 Backbone (Input -> Hidden) ===
-        # 预训练键名: gcn_shared.weight / bias
-        if k.startswith('gcn_shared'):
-            suffix = k.split('gcn_shared.')[-1] # weight 或 bias
-            
-            # (A) 赋值给生成视图的 Backbone
-            target_gen = f"view_gen.encoder_vgae.gcn_shared.{suffix}"
-            if target_gen in model_dict:
-                new_state_dict[target_gen] = v
-                matched_count += 1
-            
-            # (B) 赋值给去噪视图的 Backbone (初始化 DenoisingNet)
-            # DenoisingNet 的结构是 nblayers_0 -> Sequential -> [0] Linear
-            # 注意：AdaGCL 的 DenoisingNet 有 nblayers 和 selflayers 两组
-            target_den_nb = f"view_den.nblayers_0.0.{suffix}"
-            if target_den_nb in model_dict:
-                new_state_dict[target_den_nb] = v
-                matched_count += 1
-                
-            target_den_self = f"view_den.selflayers_0.0.{suffix}"
-            if target_den_self in model_dict:
-                new_state_dict[target_den_self] = v
-                matched_count += 1
-
-        # === 2. 匹配 MLP Head (Hidden -> Z) ===
-        # 预训练键名: encoder_mean.0.weight, encoder_mean.2.bias 等
-        elif k.startswith('encoder_mean'):
-            # 直接提取 encoder_mean 之后的部分 (例如 "0.weight")
-            suffix = k.split('encoder_mean.')[-1]
-            
-            # (A) 赋值给生成视图的 encoder_mean
-            target_gen_mean = f"view_gen.encoder_vgae.encoder_mean.{suffix}"
-            if target_gen_mean in model_dict:
-                new_state_dict[target_gen_mean] = v
-                matched_count += 1
-            
-            # (B) 可选：同时也赋值给 encoder_std (LogStd) 
-            # 虽然 std 应该只有 mean 的一半大小或者随机，但用预训练的 mean 权重做初始化
-            # 往往比随机初始化更稳定（相当于初始假设方差结构与均值结构相关）
-            target_gen_std = f"view_gen.encoder_vgae.encoder_std.{suffix}"
-            if target_gen_std in model_dict:
-                new_state_dict[target_gen_std] = v
-                matched_count += 1
-
-    if matched_count == 0:
-        print("!! 警告: 依然没有匹配到权重。请检查预训练文件是否是用 pretrain_gae_adagcl.py 生成的。")
-        print("预训练文件键名示例:", list(pretrained_dict.keys()))
+def load_pretrained(model, path):
+    if os.path.exists(path):
+        print(f"Loading full pretrained fusion model from {path}...")
+        model.load_state_dict(torch.load(path, map_location=args.device), strict=False)
     else:
-        model_dict.update(new_state_dict)
-        model.load_state_dict(model_dict, strict=False)
-        print(f"成功匹配并加载了 {matched_count} 个参数张量！(包括生成视图和去噪视图)")
+        print("Pretrain file not found, starting from scratch.")
+
+def feature_align_loss(z1, z2):
+    # 使用 Cosine Similarity 使得两个向量方向一致
+    # z1, z2: [Batch, Dim]
+    z1_norm = F.normalize(z1, dim=1)
+    z2_norm = F.normalize(z2, dim=1)
+    # 我们希望相似度越大越好，所以 Loss 是负的相似度，或者 2 - 2*sim (MSE of normalized vectors)
+    # 这里用 MSE of normalized vectors: ||z1' - z2'||^2 = 2 - 2*cos(theta)
+    return torch.mean((z1_norm - z2_norm).pow(2))
 
 # ====================================================================
 # 主程序
@@ -210,7 +131,7 @@ if __name__ == "__main__":
     ).to(args.device)
 
     # 3. 加载预训练权重
-    load_gae_to_vgae(model, args.pretrain_path, args.device)
+    load_pretrained(model, './model_pretrain/dblp_fusion_pretrain.pkl')
     
     # 4. 初始化 En-CLU Loss
     criterion_en_clu = ClusterLoss(args.n_clusters, args.cluster_temp, args.device).to(args.device)
@@ -236,7 +157,7 @@ if __name__ == "__main__":
 
     # 6. 训练
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
     # Pos Weight 用于重构 Loss
     pos_weight_val = float(adj_label.shape[0]**2 - adj_label.sum()) / adj_label.sum()
     norm_val = adj_label.shape[0]**2 / float((adj_label.shape[0]**2 - adj_label.sum()) * 2)
@@ -244,10 +165,12 @@ if __name__ == "__main__":
     
     print("\n[Start Training]")
     model.train() # 切回训练模式
-
+    best_acc = 0
+    best_epoch = 0
+    best_model_path = 'best_fusion_model.pkl'
     for epoch in range(args.epochs):
         # Target Distribution 更新
-        if epoch % 1 == 0:
+        if epoch % 5 == 0:
             with torch.no_grad():
                 out = model(feat, adj_sparse)
                 q_fused = out['q']
@@ -294,11 +217,45 @@ if __name__ == "__main__":
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        
+        scheduler.step()
+
         if epoch % 10 == 0 or epoch == args.epochs - 1:
             y_pred = q_fused.argmax(1).cpu().numpy()
             acc, nmi, ari, f1 = eva(label.cpu().numpy(), y_pred)
             print(f"Epoch {epoch:03d} | Loss: {loss.item():.4f} | En-CLU: {en_clu_loss.item():.4f} | ACC: {acc:.4f} | NMI: {nmi:.4f}")
-
+            if acc > best_acc:
+                best_acc = acc
+                best_epoch = epoch
+                torch.save(model.state_dict(), best_model_path)
+            att_w = out['att_weights'].mean(dim=0).squeeze().detach().cpu().numpy()
+            print(f"   >> Attention Weights - Gen: {att_w[0]:.4f} | Den: {att_w[1]:.4f}")
+            
     print("\nTraining Finished.")
     print(f"Final Result: ACC: {acc:.4f} | NMI: {nmi:.4f} | ARI: {ari:.4f} | F1: {f1:.4f}")
+    print("\nTraining Finished.")
+    print(f"Recorded Best Epoch: {best_epoch} | Best ACC: {best_acc:.4f}")
+
+    # === 新增：加载最佳模型并重新评估 ===
+    best_model_path = 'best_fusion_model.pkl' # 确保这里的文件名和你保存时的一致
+    
+    if os.path.exists(best_model_path):
+        print(f"\n>> Loading Best Model from {best_model_path}...")
+        # 加载权重
+        model.load_state_dict(torch.load(best_model_path, map_location=args.device))
+        
+        # 重新评估
+        model.eval()
+        with torch.no_grad():
+            out = model(feat, adj_sparse)
+            q_fused = out['q']
+            y_pred = q_fused.argmax(1).cpu().numpy()
+            
+            # 计算指标
+            final_acc, final_nmi, final_ari, final_f1 = eva(label.cpu().numpy(), y_pred)
+            
+        print("="*60)
+        print(f"FINAL BEST RESULT (Restored):")
+        print(f"ACC: {final_acc:.4f} | NMI: {final_nmi:.4f} | ARI: {final_ari:.4f} | F1: {final_f1:.4f}")
+        print("="*60)
+    else:
+        print("!! Warning: Best model file not found.")

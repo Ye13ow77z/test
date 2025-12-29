@@ -17,7 +17,7 @@ class GlobalArgs:
         self.latdim = 256
         self.gnn_layer = 2
         self.temp = 0.2
-        self.gamma = -0.1
+        self.gamma = -0.5
         self.zeta = 1.1
         self.lambda0 = 1e-4 # L0 loss weight
         self.reg = 1e-4
@@ -185,48 +185,91 @@ class DenoisingNet(nn.Module):
         indices = adj._indices()
         row, col = indices[0], indices[1]
         
-        f1_features = x[row] # Source Node Features
-        f2_features = x[col] # Target Node Features
+        f1_features = x[row] 
+        f2_features = x[col] 
         
-        # 2. 计算 Attention (Log Alpha)
+        # 2. 计算 Attention 并保存用于 L0 Loss
         weight = self.get_attention(f1_features, f2_features)
-        self.edge_weights = [weight] # 存起来算 Loss
+        self.edge_weights = [weight] 
         
-        # 3. Hard Concrete Sample 得到 Mask
+        # 3. 采样 Mask
         mask = self.hard_concrete_sample(weight, beta=1.0, training=training)
         mask = mask.squeeze()
         
-        # 4. 构造去噪后的图
-        new_values = adj._values() * mask
-        new_adj = torch.sparse.FloatTensor(indices, new_values, adj.shape).coalesce()
+        # 4. 构造去噪图 (Masked Values)
+        # 此时 adj_masked 还是非归一化的，直接用会有数值问题
+        masked_values = adj._values() * mask
         
-        # 归一化 (GCN 需要)
-        # 简单的对称归一化逻辑
-        rowsum = torch.sparse.sum(new_adj, dim=1).to_dense() + 1e-6
+        # --- 关键修改开始：稀疏对称归一化 (Symmetric Normalization) ---
+        
+        # 步骤 A: 构造一个临时的 coalesced 稀疏矩阵用于计算度
+        # 必须先 coalesce，因为同索引的边权重需要累加，否则 rowsum 计算错误
+        temp_adj = torch.sparse.FloatTensor(indices, masked_values, adj.shape).coalesce()
+        temp_indices = temp_adj._indices()
+        temp_values = temp_adj._values()
+        
+        # 步骤 B: 计算度 (Degree)
+        # sparse.sum() 返回的是 dense 的 degree 向量 (N,)
+        rowsum = torch.sparse.sum(temp_adj, dim=1).to_dense() + 1e-10
+        
+        # 步骤 C: 计算 D^-0.5
         d_inv_sqrt = torch.pow(rowsum, -0.5)
         d_inv_sqrt[torch.isinf(d_inv_sqrt)] = 0.
         
-        d_mat_inv_sqrt = torch.diag(d_inv_sqrt)
-        # D^-0.5 * A * D^-0.5 (Dense 近似，稀疏乘法太慢)
-        # 为了效率，这里直接返回 new_adj，假设 GCN 内部能处理或外部处理
-        return new_adj
+        # 步骤 D: 应用归一化 v' = v * d_i^-0.5 * d_j^-0.5
+        # 利用广播机制直接对 values 进行操作，避免构建 dense 矩阵
+        temp_row, temp_col = temp_indices[0], temp_indices[1]
+        norm_values = temp_values * d_inv_sqrt[temp_row] * d_inv_sqrt[temp_col]
+        
+        # 步骤 E: 构造最终的归一化稀疏图
+        adj_den_norm = torch.sparse.FloatTensor(temp_indices, norm_values, adj.shape)
+        
+        return adj_den_norm
 
 # ====================================================================
 # 2. 融合与主模型 (AdaDCRN_VGAE)
 # ====================================================================
 
-class DCRN_Fusion(nn.Module):
-    def __init__(self, num_nodes, hidden_dim):
-        super(DCRN_Fusion, self).__init__()
-        self.a = nn.Parameter(torch.ones(num_nodes, hidden_dim) * 0.5)
-        self.b = nn.Parameter(torch.ones(num_nodes, hidden_dim) * 0.5)
-        self.alpha = nn.Parameter(torch.tensor(0.5))
+# class DCRN_Fusion(nn.Module):
+#     def __init__(self, num_nodes, hidden_dim):
+#         super(DCRN_Fusion, self).__init__()
+#         self.a = nn.Parameter(torch.ones(num_nodes, hidden_dim) * 1.0)
+#         self.b = nn.Parameter(torch.ones(num_nodes, hidden_dim) * 0.01)
+#         self.alpha = nn.Parameter(torch.tensor(0.5))
 
-    def forward(self, z1, z2, adj):
-        z_i = self.a * z1 + self.b * z2
-        z_l = torch.spmm(adj, z_i)
-        z_fused = self.alpha * z_l + (1 - self.alpha) * z_i
-        return z_fused
+#     def forward(self, z1, z2, adj):
+#         z_i = self.a * z1 + self.b * z2
+#         z_l = torch.spmm(adj, z_i)
+#         z_fused = self.alpha * z_l + (1 - self.alpha) * z_i
+#         return z_fused
+class AttentionFusion(nn.Module):
+    """
+    轻量级注意力融合层：输入 K 个视图，输出加权后的全局视图。
+    """
+    def __init__(self, input_dim):
+        super(AttentionFusion, self).__init__()
+        # 一个简单的 MLP 来计算注意力分数
+        self.att = nn.Sequential(
+            nn.Linear(input_dim, 32),
+            nn.Tanh(),
+            nn.Linear(32, 1, bias=False) # 输出标量分数
+        )
+        self.force_uniform = False # 新增开关
+    
+    def forward(self, z_list):
+        # z_list: [z1, z2] -> 每个都是 [Batch, Dim]
+        # 堆叠 -> [Batch, 2, Dim]
+        h = torch.stack(z_list, dim=1) 
+        
+        # 计算每个视图的分数 -> [Batch, 2, 1]
+        att_score = self.att(h)
+        # Softmax 归一化，保证权重之和为 1
+        weights = F.softmax(att_score, dim=1) 
+        
+        # 加权求和: (Batch, 2, Dim) * (Batch, 2, 1) -> Sum dim 1 -> (Batch, Dim)
+        z_global = torch.sum(h * weights, dim=1)
+        
+        return z_global, weights
 
 class AdaDCRN_VGAE(nn.Module):
     def __init__(self, num_nodes, input_dim, hidden_dim, num_clusters, gae_dims):
@@ -240,7 +283,6 @@ class AdaDCRN_VGAE(nn.Module):
         args.gnn_layer = 2
         
         z_dim = gae_dims[-1]
-        
         # === 核心组件实例化 ===
         
         # 1. 生成视图 (VGAE)
@@ -253,7 +295,7 @@ class AdaDCRN_VGAE(nn.Module):
         self.view_den = DenoisingNet(input_dim, hidden_dim)
         
         # 3. 融合层
-        self.fusion = DCRN_Fusion(num_nodes, z_dim)
+        self.fusion = AttentionFusion(z_dim)
         
         # 4. 聚类头
         self.head = nn.Linear(z_dim, num_clusters)
@@ -269,7 +311,7 @@ class AdaDCRN_VGAE(nn.Module):
         
         # B. 去噪视图流 (Denoising View)
         # 1. 学习去噪掩码并生成去噪图 (Learnable Mask)
-        adj_den = self.view_den.generate(x, adj, training=self.training)
+        adj_den = self.view_den.generate(x,adj,training=self.training)
         
         # 2. 计算 L0 Regularization Loss (用于稀疏化)
         l0_loss = self.view_den.l0_norm(self.view_den.edge_weights[0])
@@ -279,7 +321,7 @@ class AdaDCRN_VGAE(nn.Module):
         z_den, _, _ = self.view_gen.encoder(x, adj_den)
         
         # C. 融合 (Fusion)
-        z_fused = self.fusion(z_gen, z_den, adj)
+        z_fused, weights = self.fusion([z_gen, z_den])
         
         # D. 聚类输出 (En-CLU)
         q_fused = F.softmax(self.head(z_fused), dim=1)
@@ -294,5 +336,7 @@ class AdaDCRN_VGAE(nn.Module):
             "z_fused": z_fused,
             "mu": mu,                 # VGAE KL Loss 用
             "logstd": logstd,
-            "l0_loss": l0_loss        # 加入总 Loss
+            "l0_loss": l0_loss,       # 加入总 Loss
+            "z_den": z_den,
+            "att_weights": weights
         }
