@@ -29,7 +29,7 @@ class Args:
     def __init__(self):
         self.dataset = 'dblp'
         # 预训练权重路径
-        self.pretrain_path = f'./DCRN/model_pretrain/{self.dataset}_adagcl_pretrain.pkl'
+        self.pretrain_path = f'./model_pretrain/{self.dataset}_fusion_pretrain.pkl'
         
         # 自动填充
         self.n_clusters = 0       
@@ -45,7 +45,7 @@ class Args:
         self.lambda_recon = 0.5   
         self.lambda_kl_cluster = 1.0  
         self.lambda_vgae = 0.5        
-        self.lambda_en_clu = 1.5  # 提高 En-CLU 权重，强调对比
+        self.lambda_en_clu = 0.3
         self.cluster_temp = 1.0       
 
 args = Args()
@@ -131,7 +131,7 @@ if __name__ == "__main__":
     ).to(args.device)
 
     # 3. 加载预训练权重
-    load_pretrained(model, './model_pretrain/dblp_fusion_pretrain.pkl')
+    load_pretrained(model, args.pretrain_path)
     
     # 4. 初始化 En-CLU Loss
     criterion_en_clu = ClusterLoss(args.n_clusters, args.cluster_temp, args.device).to(args.device)
@@ -167,7 +167,7 @@ if __name__ == "__main__":
     model.train() # 切回训练模式
     best_acc = 0
     best_epoch = 0
-    best_model_path = 'best_fusion_model.pkl'
+    best_model_path = f'best_fusion_model_{args.dataset}.pkl'
     for epoch in range(args.epochs):
         # Target Distribution 更新
         if epoch % 5 == 0:
@@ -227,8 +227,9 @@ if __name__ == "__main__":
                 best_acc = acc
                 best_epoch = epoch
                 torch.save(model.state_dict(), best_model_path)
+                print(f"   >> [New Best] Model saved to {best_model_path} (ACC: {best_acc:.4f})")
             att_w = out['att_weights'].mean(dim=0).squeeze().detach().cpu().numpy()
-            print(f"   >> Attention Weights - Gen: {att_w[0]:.4f} | Den: {att_w[1]:.4f}")
+            print(f"   >> Attn: Gen {att_w[0]:.3f} | Den {att_w[1]:.3f} || L0 Loss: {l0_loss.item():.6f}")
             
     print("\nTraining Finished.")
     print(f"Final Result: ACC: {acc:.4f} | NMI: {nmi:.4f} | ARI: {ari:.4f} | F1: {f1:.4f}")
@@ -236,26 +237,21 @@ if __name__ == "__main__":
     print(f"Recorded Best Epoch: {best_epoch} | Best ACC: {best_acc:.4f}")
 
     # === 新增：加载最佳模型并重新评估 ===
-    best_model_path = 'best_fusion_model.pkl' # 确保这里的文件名和你保存时的一致
     
     if os.path.exists(best_model_path):
         print(f"\n>> Loading Best Model from {best_model_path}...")
-        # 加载权重
         model.load_state_dict(torch.load(best_model_path, map_location=args.device))
         
-        # 重新评估
         model.eval()
         with torch.no_grad():
             out = model(feat, adj_sparse)
             q_fused = out['q']
             y_pred = q_fused.argmax(1).cpu().numpy()
-            
-            # 计算指标
             final_acc, final_nmi, final_ari, final_f1 = eva(label.cpu().numpy(), y_pred)
             
         print("="*60)
-        print(f"FINAL BEST RESULT (Restored):")
+        print(f"FINAL BEST RESULT (Restored) on {args.dataset}:")
         print(f"ACC: {final_acc:.4f} | NMI: {final_nmi:.4f} | ARI: {final_ari:.4f} | F1: {final_f1:.4f}")
         print("="*60)
     else:
-        print("!! Warning: Best model file not found.")
+        print(f"!! Warning: Best model file {best_model_path} not found.")

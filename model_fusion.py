@@ -24,6 +24,7 @@ class GlobalArgs:
 
 args = GlobalArgs()
 
+
 # 初始化函数
 init = nn.init.xavier_uniform_
 
@@ -204,7 +205,7 @@ class DenoisingNet(nn.Module):
         
         # 步骤 A: 构造一个临时的 coalesced 稀疏矩阵用于计算度
         # 必须先 coalesce，因为同索引的边权重需要累加，否则 rowsum 计算错误
-        temp_adj = torch.sparse.FloatTensor(indices, masked_values, adj.shape).coalesce()
+        temp_adj = torch.sparse_coo_tensor(indices, masked_values, adj.shape, device=adj.device).coalesce()
         temp_indices = temp_adj._indices()
         temp_values = temp_adj._values()
         
@@ -222,7 +223,7 @@ class DenoisingNet(nn.Module):
         norm_values = temp_values * d_inv_sqrt[temp_row] * d_inv_sqrt[temp_col]
         
         # 步骤 E: 构造最终的归一化稀疏图
-        adj_den_norm = torch.sparse.FloatTensor(temp_indices, norm_values, adj.shape)
+        adj_den_norm = torch.sparse_coo_tensor(temp_indices, norm_values, adj.shape, device=adj.device)
         
         return adj_den_norm
 
@@ -270,7 +271,6 @@ class AttentionFusion(nn.Module):
         z_global = torch.sum(h * weights, dim=1)
         
         return z_global, weights
-
 class AdaDCRN_VGAE(nn.Module):
     def __init__(self, num_nodes, input_dim, hidden_dim, num_clusters, gae_dims):
         super(AdaDCRN_VGAE, self).__init__()
