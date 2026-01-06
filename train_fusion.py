@@ -14,11 +14,14 @@ from sklearn.metrics import normalized_mutual_info_score, adjusted_rand_score, f
 from scipy.optimize import linear_sum_assignment 
 
 # 1. 引入工具和模型
-from utils_data import load_graph_data
-from model_fusion import AdaDCRN_VGAE
+try:
+    from utils_data import load_graph_data
+    from utils_acm import load_acm
+    from utils_cite import load_citeseer
+except ImportError as e:
+    print(f"Warning: Import failed: {e}. Make sure util files exist.")
 
-# 2. 引入 LUCE 的 En-CLU Loss
-# 确保你的目录下有这个文件
+from model_fusion import AdaDCRN_VGAE
 from LUCE_CMC.src.lib.contrastive_loss import ClusterLoss
 
 # ====================================================================
@@ -34,19 +37,19 @@ class Args:
         # 自动填充
         self.n_clusters = 0       
         self.n_input = 0       
-        self.hidden_dim = 256     
+        self.hidden_dim = 512
         self.gae_dims = [] 
         
-        self.lr = 1e-3
-        self.epochs = 200
+        self.lr = 2e-4
+        self.epochs = 400
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
         # Loss 权重 
-        self.lambda_recon = 0.5   
-        self.lambda_kl_cluster = 1.0  
-        self.lambda_vgae = 0.5        
-        self.lambda_en_clu = 0.3
-        self.cluster_temp = 1.0       
+        self.lambda_recon = 1.0  
+        self.lambda_kl_cluster = 10.0
+        self.lambda_vgae = 1.0       
+        self.lambda_en_clu = 10.0    
+        self.cluster_temp = 0.5     
 
 args = Args()
 
@@ -70,12 +73,12 @@ def eva(y_true, y_pred):
     return acc, nmi, ari, f1
 
 def target_distribution(q):
-    weight = q**2 / q.sum(0)
-    return (weight.t() / weight.sum(1)).t()
+    # 数值稳定保护
+    weight = q**2 / (q.sum(0) + 1e-15)
+    return (weight.t() / (weight.sum(1) + 1e-15)).t()
 
 def vgae_kl_loss(mu, logstd):
     return -0.5 / mu.size(0) * torch.mean(torch.sum(1 + 2 * logstd - mu.pow(2) - (2 * logstd).exp(), dim=1))
-
 
 def load_pretrained(model, path):
     if os.path.exists(path):
@@ -84,48 +87,56 @@ def load_pretrained(model, path):
     else:
         print("Pretrain file not found, starting from scratch.")
 
-def feature_align_loss(z1, z2):
-    # 使用 Cosine Similarity 使得两个向量方向一致
-    # z1, z2: [Batch, Dim]
-    z1_norm = F.normalize(z1, dim=1)
-    z2_norm = F.normalize(z2, dim=1)
-    # 我们希望相似度越大越好，所以 Loss 是负的相似度，或者 2 - 2*sim (MSE of normalized vectors)
-    # 这里用 MSE of normalized vectors: ||z1' - z2'||^2 = 2 - 2*cos(theta)
-    return torch.mean((z1_norm - z2_norm).pow(2))
-
 # ====================================================================
 # 主程序
 # ====================================================================
 
 if __name__ == "__main__":
-    # 1. 加载数据
-    adj, feat, label, adj_label = load_graph_data(
-        args.dataset, 
-        path='./DCRN/dataset/', 
-        use_pca=False, 
-        device=args.device
-    )
     
-    # === 关键修正：转换为稀疏张量 ===
-    # AdaGCL 需要 sparse adjacency matrix 来调用 _indices()
-    print("Converting Adjacency Matrix to Sparse Tensor...")
-    # 注意：adj 是归一化后的 dense tensor
-    # 使用 to_sparse() 转换
-    adj_sparse = adj.to_sparse().to(args.device)
-    
+    # === 1. 数据加载逻辑分支 ===
+    if args.dataset == 'acm':
+        print(f">> Loading ACM data via utils_acm...")
+        # ACM 路径：直接指向 .mat 文件
+        acm_path = './DCRN/dataset/ACM3025.mat'
+        # load_acm 返回的已经是 sparse adj
+        adj_sparse, feat, label, adj_label = load_acm(acm_path, args.device)
+        
+        # ACM 的隐藏层通常设置宽一点，如果你预训练用了 512，这里也得是 512
+        # 假设你之前预训练用的 512 (根据之前的对话)
+        args.hidden_dim = 512 
+    elif args.dataset == 'citeseer':
+        print(f">> Loading Citeseer data via utils_cite...")
+        # Citeseer 路径：指向数据目录
+        cite_path = './DCRN/dataset/citeseer/'
+        adj_sparse, feat, label, adj_label = load_citeseer(cite_path, args.device)
+        
+        args.hidden_dim = 512 # Citeseer 通常用 512 隐藏层
+    else:
+        print(f">> Loading {args.dataset} data via utils_data...")
+        adj, feat, label, adj_label = load_graph_data(
+            args.dataset, 
+            path='./DCRN/dataset/', 
+            use_pca=False, 
+            device=args.device
+        )
+        print("Converting Adjacency Matrix to Sparse Tensor...")
+        adj_sparse = adj.to_sparse().to(args.device)
+        args.hidden_dim = 512 # Cora/DBLP 默认
+
     # 动态更新参数
     args.n_input = feat.shape[1]                
-    args.n_clusters = len(torch.unique(label))  
-    args.gae_dims = [args.n_input, 256, 50]     
+    args.n_clusters = len(torch.unique(label))
+    # 保持与预训练一致的维度结构
+    args.gae_dims = [args.n_input, args.hidden_dim, 64 if args.hidden_dim == 512 else 50]     
     
     print(f"\n>> Dataset: {args.dataset}")
-    print(f">> Input Dim: {args.n_input}, Clusters: {args.n_clusters}")
+    print(f">> Input Dim: {args.n_input}, Clusters: {args.n_clusters}, Hidden: {args.hidden_dim}")
 
     # 2. 初始化模型
     model = AdaDCRN_VGAE(
         num_nodes=feat.shape[0],
         input_dim=args.n_input,
-        hidden_dim=256,
+        hidden_dim=args.hidden_dim,
         num_clusters=args.n_clusters,
         gae_dims=args.gae_dims
     ).to(args.device)
@@ -139,10 +150,8 @@ if __name__ == "__main__":
     # 5. K-Means 初始化
     print("Initializing cluster centers with K-Means on Fused Features...")
     
-    # === 关键：Eval 模式 ===
     model.eval() 
     with torch.no_grad():
-        # 注意：这里传入 adj_sparse
         out_init = model(feat, adj_sparse)
         z_init = out_init['mu'].cpu().numpy()
         
@@ -157,39 +166,43 @@ if __name__ == "__main__":
 
     # 6. 训练
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
+    # 如果用 CosineAnnealing，最小 LR 不宜为 0，防止后面完全不动
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-5)
+    
     # Pos Weight 用于重构 Loss
     pos_weight_val = float(adj_label.shape[0]**2 - adj_label.sum()) / adj_label.sum()
     norm_val = adj_label.shape[0]**2 / float((adj_label.shape[0]**2 - adj_label.sum()) * 2)
     pos_weight = torch.tensor(pos_weight_val, dtype=torch.float32, device=args.device)
     
     print("\n[Start Training]")
-    model.train() # 切回训练模式
+    model.train() 
     best_acc = 0
     best_epoch = 0
     best_model_path = f'best_fusion_model_{args.dataset}.pkl'
+    
     for epoch in range(args.epochs):
         # Target Distribution 更新
-        if epoch % 5 == 0:
+        if epoch % 5 == 0: 
             with torch.no_grad():
                 out = model(feat, adj_sparse)
                 q_fused = out['q']
                 p = target_distribution(q_fused)
         
-        # Forward (传入 Sparse ADJ)
+        # Forward
         out = model(feat, adj_sparse)
         
-        q_fused = out['q']
-        q_gen   = out['q_gen']
-        q_den   = out['q_den']
+        # 数值截断保护 (防止 NaN)
+        q_fused = torch.clamp(out['q'], min=1e-15, max=1.0)
+        q_gen   = torch.clamp(out['q_gen'], min=1e-15, max=1.0)
+        q_den   = torch.clamp(out['q_den'], min=1e-15, max=1.0)
+        
         adj_logits = out['adj_logits']
         mu = out['mu']
         logstd = out['logstd']
-        l0_loss = out['l0_loss'] # 获取稀疏正则 Loss
+        l0_loss = out['l0_loss']
         
         # --- Loss ---
-        # 1. DEC Loss
-        q_fused = torch.clamp(q_fused, min=1e-15, max=1.0)
+        # 1. DEC Loss (KL Divergence)
         kl_cluster_loss = F.kl_div(q_fused.log(), p, reduction='batchmean')
         
         # 2. En-CLU Loss (对比学习)
@@ -198,8 +211,6 @@ if __name__ == "__main__":
         en_clu_loss = loss_clu_gen + loss_clu_den
         
         # 3. Recon Loss (VGAE 重构)
-        # 注意：这里 adj_logits 是 Dense 的 (N x N)，adj_label 也是 Dense 的
-        # 重构 Loss 还是用 Dense 计算比较方便，不用动
         recon_loss = norm_val * F.binary_cross_entropy_with_logits(
             adj_logits.view(-1), adj_label.view(-1), pos_weight=pos_weight
         )
@@ -212,10 +223,14 @@ if __name__ == "__main__":
              + args.lambda_recon * recon_loss \
              + args.lambda_vgae * kl_vgae \
              + args.lambda_en_clu * en_clu_loss \
-             + 1e-4 * l0_loss # L0 Regularization
+             + 1e-3 * l0_loss 
         
         optimizer.zero_grad()
         loss.backward()
+        
+        # === 梯度裁剪 (防止爆炸) ===
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+        
         optimizer.step()
         scheduler.step()
 
@@ -223,25 +238,25 @@ if __name__ == "__main__":
             y_pred = q_fused.argmax(1).cpu().numpy()
             acc, nmi, ari, f1 = eva(label.cpu().numpy(), y_pred)
             print(f"Epoch {epoch:03d} | Loss: {loss.item():.4f} | En-CLU: {en_clu_loss.item():.4f} | ACC: {acc:.4f} | NMI: {nmi:.4f}")
+            
             if acc > best_acc:
                 best_acc = acc
                 best_epoch = epoch
                 torch.save(model.state_dict(), best_model_path)
-                print(f"   >> [New Best] Model saved to {best_model_path} (ACC: {best_acc:.4f})")
-            att_w = out['att_weights'].mean(dim=0).squeeze().detach().cpu().numpy()
-            print(f"   >> Attn: Gen {att_w[0]:.3f} | Den {att_w[1]:.3f} || L0 Loss: {l0_loss.item():.6f}")
+                print(f"   >> [New Best] Model saved (ACC: {best_acc:.4f})")
             
-    print("\nTraining Finished.")
-    print(f"Final Result: ACC: {acc:.4f} | NMI: {nmi:.4f} | ARI: {ari:.4f} | F1: {f1:.4f}")
+            # 打印注意力权重看看 (如果有返回)
+            if 'att_weights' in out:
+                att_w = out['att_weights'].mean(dim=0).squeeze().detach().cpu().numpy()
+                print(f"   >> Attn: Gen {att_w[0]:.3f} | Den {att_w[1]:.3f}")
+
     print("\nTraining Finished.")
     print(f"Recorded Best Epoch: {best_epoch} | Best ACC: {best_acc:.4f}")
 
-    # === 新增：加载最佳模型并重新评估 ===
-    
+    # === 加载最佳模型并重新评估 ===
     if os.path.exists(best_model_path):
         print(f"\n>> Loading Best Model from {best_model_path}...")
         model.load_state_dict(torch.load(best_model_path, map_location=args.device))
-        
         model.eval()
         with torch.no_grad():
             out = model(feat, adj_sparse)
@@ -250,8 +265,6 @@ if __name__ == "__main__":
             final_acc, final_nmi, final_ari, final_f1 = eva(label.cpu().numpy(), y_pred)
             
         print("="*60)
-        print(f"FINAL BEST RESULT (Restored) on {args.dataset}:")
+        print(f"FINAL BEST RESULT on {args.dataset}:")
         print(f"ACC: {final_acc:.4f} | NMI: {final_nmi:.4f} | ARI: {final_ari:.4f} | F1: {final_f1:.4f}")
         print("="*60)
-    else:
-        print(f"!! Warning: Best model file {best_model_path} not found.")

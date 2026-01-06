@@ -244,32 +244,23 @@ class DenoisingNet(nn.Module):
 #         z_fused = self.alpha * z_l + (1 - self.alpha) * z_i
 #         return z_fused
 class AttentionFusion(nn.Module):
-    """
-    轻量级注意力融合层：输入 K 个视图，输出加权后的全局视图。
-    """
     def __init__(self, input_dim):
         super(AttentionFusion, self).__init__()
-        # 一个简单的 MLP 来计算注意力分数
         self.att = nn.Sequential(
             nn.Linear(input_dim, 32),
             nn.Tanh(),
-            nn.Linear(32, 1, bias=False) # 输出标量分数
+            nn.Linear(32, 1, bias=False)
         )
-        self.force_uniform = False # 新增开关
-    
+        self.temperature = 0.5 # 新增温度系数，越小越sharp，越大越平均
+
     def forward(self, z_list):
-        # z_list: [z1, z2] -> 每个都是 [Batch, Dim]
-        # 堆叠 -> [Batch, 2, Dim]
         h = torch.stack(z_list, dim=1) 
-        
-        # 计算每个视图的分数 -> [Batch, 2, 1]
         att_score = self.att(h)
-        # Softmax 归一化，保证权重之和为 1
-        weights = F.softmax(att_score, dim=1) 
         
-        # 加权求和: (Batch, 2, Dim) * (Batch, 2, 1) -> Sum dim 1 -> (Batch, Dim)
+        # 使用温度系数平滑权重，防止初期崩塌到单一视图
+        weights = F.softmax(att_score / self.temperature, dim=1) 
+        
         z_global = torch.sum(h * weights, dim=1)
-        
         return z_global, weights
 class AdaDCRN_VGAE(nn.Module):
     def __init__(self, num_nodes, input_dim, hidden_dim, num_clusters, gae_dims):
