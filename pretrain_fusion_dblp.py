@@ -31,9 +31,9 @@ class PretrainArgs:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
         # === 核心修改：加大预训练轮数，确保收敛 ===
-        self.epochs_step1 = 80  # 生成视图多练一会儿
-        self.epochs_step2 = 50 
-        self.epochs_step3 = 80 
+        self.epochs_step1 = 160  # 生成视图多练一会儿
+        self.epochs_step2 = 160 
+        self.epochs_step3 = 160 
         self.lr = 1e-3
         
         self.save_path = f'./model_pretrain/{self.dataset}_fusion_pretrain.pkl'
@@ -59,7 +59,7 @@ def main():
     
     # === 核心修改：对齐 train_fusion.py 的宽网络配置 ===
     hidden_dim = 512  # 原来是 256
-    z_dim = 64        # 原来是 50
+    z_dim = 128        # 提升到 128 (从 64) 增加表达能力
     gae_dims = [n_input, hidden_dim, z_dim] 
     
     print(f">> Pretrain Config: Input={n_input}, Hidden={hidden_dim}, Z={z_dim}")
@@ -101,7 +101,7 @@ def main():
             print(f"Step 1 | Epoch {epoch} | Loss: {loss.item():.4f}")
 
     # === Step 2: Denoising ===
-    print("\n=== Step 2: Pretraining Denoising View ===")
+    print("\n=== Step 2: Pretraining Denoising View (强化对比学习) ===")
     for epoch in range(args.epochs_step2):
         model.train()
         optimizer.zero_grad()
@@ -115,7 +115,7 @@ def main():
             print(f"Step 2 | Epoch {epoch} | Loss: {loss.item():.4f}")
 
     # === Step 3: Joint ===
-    print("\n=== Step 3: Joint Pretraining ===")
+    print("\n=== Step 3: Joint Pretraining (多视图对齐) ===")
     for epoch in range(args.epochs_step3):
         model.train()
         optimizer.zero_grad()

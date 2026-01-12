@@ -40,16 +40,18 @@ class Args:
         self.hidden_dim = 512
         self.gae_dims = [] 
         
-        self.lr = 2e-4
-        self.epochs = 400
+        self.lr = 1e-4  # 最优config from Cfg10
+        self.epochs = 300  # 300轮最优，避免过拟合
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.weight_decay = 0.0
+        self.use_amp = False
         
         # Loss 权重 
         self.lambda_recon = 1.0  
         self.lambda_kl_cluster = 10.0
         self.lambda_vgae = 1.0       
-        self.lambda_en_clu = 10.0    
-        self.cluster_temp = 0.5     
+        self.lambda_en_clu = 15.0  # 最优config from Cfg10
+        self.cluster_temp = 0.8   # 最优config from Cfg10     
 
 args = Args()
 
@@ -126,8 +128,8 @@ if __name__ == "__main__":
     # 动态更新参数
     args.n_input = feat.shape[1]                
     args.n_clusters = len(torch.unique(label))
-    # 保持与预训练一致的维度结构
-    args.gae_dims = [args.n_input, args.hidden_dim, 64 if args.hidden_dim == 512 else 50]     
+    # 保持与预训练一致的维度结构 (提升z_dim到128以匹配强化预训练)
+    args.gae_dims = [args.n_input, args.hidden_dim, 128 if args.hidden_dim == 512 else 50]     
     
     print(f"\n>> Dataset: {args.dataset}")
     print(f">> Input Dim: {args.n_input}, Clusters: {args.n_clusters}, Hidden: {args.hidden_dim}")
@@ -155,7 +157,7 @@ if __name__ == "__main__":
         out_init = model(feat, adj_sparse)
         z_init = out_init['mu'].cpu().numpy()
         
-    kmeans = KMeans(n_clusters=args.n_clusters, n_init=20)
+    kmeans = KMeans(n_clusters=args.n_clusters, n_init=100)
     y_pred = kmeans.fit_predict(z_init)
     
     model.head.weight.data = torch.tensor(kmeans.cluster_centers_).to(args.device)
@@ -165,8 +167,7 @@ if __name__ == "__main__":
     print(f"[Init] ACC: {acc:.4f} | NMI: {nmi:.4f} | ARI: {ari:.4f}")
 
     # 6. 训练
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    # 如果用 CosineAnnealing，最小 LR 不宜为 0，防止后面完全不动
+    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-5)
     
     # Pos Weight 用于重构 Loss

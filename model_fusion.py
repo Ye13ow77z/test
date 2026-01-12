@@ -40,43 +40,40 @@ class GCNLayer(nn.Module):
         # 适配: DBLP 数据通常是 torch.sparse.FloatTensor
         # AdaGCL 原版处理 SparseTensor，这里做兼容
         if (flag):
-            return torch.spmm(adj, embeds)
+            # sparse matmul doesn't support float16; disable autocast for this op
+            if torch.is_autocast_enabled():
+                with torch.cuda.amp.autocast(enabled=False):
+                    return torch.spmm(adj, embeds)
+            else:
+                return torch.spmm(adj, embeds)
         else:
             # 如果传入的是 coalesced sparse tensor
             if adj.is_sparse:
-                return torch.spmm(adj, embeds)
+                if torch.is_autocast_enabled():
+                    with torch.cuda.amp.autocast(enabled=False):
+                        return torch.spmm(adj, embeds)
+                else:
+                    return torch.spmm(adj, embeds)
             else:
                 return torch.mm(adj, embeds)
 
 class vgae_encoder(nn.Module):
     def __init__(self, input_dim, hidden_dim, z_dim):
         super(vgae_encoder, self).__init__()
-        # 这里的 hidden 对应 AdaGCL 的 latdim
-        # 我们稍微修改 __init__ 以支持动态维度，但保持 forward 逻辑不变
-        self.gcn_shared = nn.Linear(input_dim, hidden_dim) # 模拟 forward_graphcl 的 GCN
-        
+        self.gcn_shared = nn.Linear(input_dim, hidden_dim)
         self.encoder_mean = nn.Sequential(nn.Linear(hidden_dim, z_dim), nn.ReLU(inplace=True), nn.Linear(z_dim, z_dim))
         self.encoder_std = nn.Sequential(nn.Linear(hidden_dim, z_dim), nn.ReLU(inplace=True), nn.Linear(z_dim, z_dim), nn.Softplus())
-        
-        # 初始化
         nn.init.xavier_uniform_(self.gcn_shared.weight)
 
     def forward(self, x, adj):
-        # 1. GCN 编码 (模拟 forward_graphcl)
-        # AdaGCL 原版是用多层 GCN，这里我们用一层或两层来提取特征
         hidden = F.relu(torch.spmm(adj, self.gcn_shared(x)))
-        
-        # 2. VGAE Head
         x_mean = self.encoder_mean(hidden)
         x_std = self.encoder_std(hidden)
-        
-        # 3. Reparameterization
         if self.training:
             gaussian_noise = torch.randn_like(x_mean)
             z = gaussian_noise * x_std + x_mean
         else:
             z = x_mean
-            
         return z, x_mean, x_std
 
 class vgae_decoder(nn.Module):
@@ -246,12 +243,16 @@ class DenoisingNet(nn.Module):
 class AttentionFusion(nn.Module):
     def __init__(self, input_dim):
         super(AttentionFusion, self).__init__()
+        # 初始化时使用较小权重，避免生成视图主导
         self.att = nn.Sequential(
             nn.Linear(input_dim, 32),
             nn.Tanh(),
             nn.Linear(32, 1, bias=False)
         )
-        self.temperature = 0.5 # 新增温度系数，越小越sharp，越大越平均
+        # 初始化第二层权重使得初始注意力较为平衡
+        with torch.no_grad():
+            self.att[2].weight.fill_(0.0)  # 平衡初始化
+        self.temperature = 0.5 # 平衡温度，让生成和去噪视图都有贡献
 
     def forward(self, z_list):
         h = torch.stack(z_list, dim=1) 

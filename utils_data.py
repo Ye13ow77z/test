@@ -20,8 +20,16 @@ def get_adj_normalized(adj):
     
     # D^-0.5 * (A+I) * D^-0.5
     adj_normalized = adj_.dot(degree_mat_inv_sqrt).transpose().dot(degree_mat_inv_sqrt).tocoo()
-    
-    return torch.FloatTensor(adj_normalized.toarray())
+
+    # Convert scipy.sparse.coo_matrix to torch.sparse_coo_tensor (keep sparse)
+    coo = adj_normalized.tocoo()
+    indices = np.vstack((coo.row, coo.col)).astype(np.int64)
+    values = coo.data.astype(np.float32)
+    indices_t = torch.from_numpy(indices)
+    values_t = torch.from_numpy(values)
+    shape = torch.Size(coo.shape)
+
+    return torch.sparse_coo_tensor(indices_t, values_t, shape).coalesce()
 
 
 def load_graph_data(dataset_name, path='./DCRN/dataset/', use_pca=False, pca_dim=50, device='cpu'):
@@ -103,7 +111,7 @@ def load_graph_data(dataset_name, path='./DCRN/dataset/', use_pca=False, pca_dim
     # 注意：如果图特别大，这里转 Dense 可能会爆显存，Cora 这种小图没问题
     adj_dense_tensor = torch.FloatTensor(adj.toarray()).to(device)
 
-    # 格式 B: 归一化 Adj (用于 GCN 输入)
+    # 格式 B: 归一化 Adj (用于 GCN 输入) — 返回稀疏 tensor
     print("Normalizing Adjacency Matrix...")
     adj_norm = get_adj_normalized(adj).to(device)
     
