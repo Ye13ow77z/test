@@ -3,13 +3,10 @@ from torch import nn
 import torch.nn.functional as F
 import numpy as np
 from copy import deepcopy
-import scipy.sparse as sp
-import math
 
 # ====================================================================
 # 0. 适配层 (Global Args Proxy)
 # ====================================================================
-# 不修改 AdaGCL 源码中的 args.x 调用，定义一个全局代理
 class GlobalArgs:
     def __init__(self):
         self.user = 0
@@ -24,51 +21,58 @@ class GlobalArgs:
 
 args = GlobalArgs()
 
-
 # 初始化函数
 init = nn.init.xavier_uniform_
 
 # ====================================================================
-# 1. 原始 AdaGCL 组件 (Original Components from AdaGCL/Model.py)
+# 1. 基础组件
 # ====================================================================
 
 class GCNLayer(nn.Module):
-    def __init__(self):
+    def __init__(self, in_features, out_features):
         super(GCNLayer, self).__init__()
+        self.linear = nn.Linear(in_features, out_features)
+        nn.init.xavier_uniform_(self.linear.weight)
 
-    def forward(self, adj, embeds, flag=True):
-        # 适配: DBLP 数据通常是 torch.sparse.FloatTensor
-        # AdaGCL 原版处理 SparseTensor，这里做兼容
-        if (flag):
-            # sparse matmul doesn't support float16; disable autocast for this op
-            if torch.is_autocast_enabled():
-                with torch.cuda.amp.autocast(enabled=False):
-                    return torch.spmm(adj, embeds)
-            else:
-                return torch.spmm(adj, embeds)
+    def forward(self, x, adj):
+        # 1. Linear Transformation
+        x = self.linear(x)
+        # 2. Sparse Propagation
+        # 兼容 torch.sparse 和 dense tensor
+        if adj.is_sparse:
+            out = torch.spmm(adj, x)
         else:
-            # 如果传入的是 coalesced sparse tensor
-            if adj.is_sparse:
-                if torch.is_autocast_enabled():
-                    with torch.cuda.amp.autocast(enabled=False):
-                        return torch.spmm(adj, embeds)
-                else:
-                    return torch.spmm(adj, embeds)
-            else:
-                return torch.mm(adj, embeds)
+            out = torch.mm(adj, x)
+        return F.relu(out)
 
 class vgae_encoder(nn.Module):
     def __init__(self, input_dim, hidden_dim, z_dim):
         super(vgae_encoder, self).__init__()
-        self.gcn_shared = nn.Linear(input_dim, hidden_dim)
-        self.encoder_mean = nn.Sequential(nn.Linear(hidden_dim, z_dim), nn.ReLU(inplace=True), nn.Linear(z_dim, z_dim))
-        self.encoder_std = nn.Sequential(nn.Linear(hidden_dim, z_dim), nn.ReLU(inplace=True), nn.Linear(z_dim, z_dim), nn.Softplus())
-        nn.init.xavier_uniform_(self.gcn_shared.weight)
+        # 使用自定义 GCNLayer 替换原来的手动 spmm 实现，结构更清晰
+        self.base_gcn = GCNLayer(input_dim, hidden_dim)
+        
+        # 均值和方差层
+        self.encoder_mean = nn.Sequential(
+            nn.Linear(hidden_dim, z_dim),
+            nn.ReLU(inplace=True), 
+            nn.Linear(z_dim, z_dim)
+        )
+        self.encoder_std = nn.Sequential(
+            nn.Linear(hidden_dim, z_dim), 
+            nn.ReLU(inplace=True), 
+            nn.Linear(z_dim, z_dim), 
+            nn.Softplus()
+        )
 
     def forward(self, x, adj):
-        hidden = F.relu(torch.spmm(adj, self.gcn_shared(x)))
+        # Base GCN Layer
+        hidden = self.base_gcn(x, adj)
+        
+        # Latent Variables
         x_mean = self.encoder_mean(hidden)
         x_std = self.encoder_std(hidden)
+        
+        # Reparameterization Trick
         if self.training:
             gaussian_noise = torch.randn_like(x_mean)
             z = gaussian_noise * x_std + x_mean
@@ -77,13 +81,15 @@ class vgae_encoder(nn.Module):
         return z, x_mean, x_std
 
 class vgae_decoder(nn.Module):
-    def __init__(self, hidden=256):
+    def __init__(self):
         super(vgae_decoder, self).__init__()
-        self.decoder = nn.Sequential(nn.ReLU(inplace=True), nn.Linear(hidden, hidden), nn.ReLU(inplace=True), nn.Linear(hidden, 1))
+        # 移除了 MLP，统一使用 Inner Product Decoder
+        # 这对于图聚类任务更标准，且保证训练和生成的一致性
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, z):
-        # 原版是用 users/items 索引做点积，这里做全图重构 (Dot Product)
+        # 训练用：全图 Logits (N x N)
+        # 注意：对于超大图可能需要负采样优化，但在 DBLP/ACM 规模通常可以直接算
         adj_logits = torch.mm(z, z.t())
         return adj_logits
 
@@ -99,31 +105,39 @@ class vgae(nn.Module):
         return z, adj_logits, x_mean, x_std
 
     def generate(self, x, adj):
-        # AdaGCL 的生成逻辑：用 decoder 生成概率，然后采样 mask
-        z, _, _ = self.encoder(x, adj)
+        """
+        生成视图逻辑：
+        使用训练好的 Encoder 得到 Z，通过 Inner Product 计算边概率，
+        并采样生成新的增强图结构。
+        """
+        # 1. 获取潜在表示
+        with torch.no_grad():
+            z, _, _ = self.encoder(x, adj)
         
-        # 这里的逻辑是将 Z 经过 Decoder MLP 得到边权重
-        # 为了简化全图计算，我们只采样存在的边 (Indices)
+        # 2. 仅计算现有边的概率 (Masked Attention 思想)
+        # 为了保持稀疏性，我们不生成全连接图，而是对现有结构进行重加权/筛选
         indices = adj._indices()
         row, col = indices[0], indices[1]
         
         z_row = z[row]
         z_col = z[col]
         
-        # Decoder 输出 logits
-        edge_logits = self.decoder.decoder(z_row * z_col).squeeze()
-        edge_probs = self.sigmoid(edge_logits)
+        # Inner Product: (N_edges, D) * (N_edges, D) -> sum -> (N_edges,)
+        edge_logits = (z_row * z_col).sum(dim=1)
+        edge_probs = torch.sigmoid(edge_logits)
         
-        # 采样 Mask (保留概率 > 0.5 的边)
+        # 3. 采样 Mask (保留概率 > 0.5 的边)
+        # 也可以加入随机性： torch.bernoulli(edge_probs)
         mask = ((edge_probs + 0.5).floor()).type(torch.bool)
         
-        # 构造新图
+        # 4. 构造新图
         new_indices = indices[:, mask]
         new_values = adj._values()[mask]
         
-        # 归一化 (保持总边权与原图一致)
+        # 5. 归一化 (保持总边权能量守恒，可选)
         if new_values.sum() > 0:
-            new_values = new_values * (adj._values().sum() / new_values.sum())
+            ratio = adj._values().sum() / (new_values.sum() + 1e-12)
+            new_values = new_values * ratio
             
         new_adj = torch.sparse.FloatTensor(new_indices, new_values, adj.shape).coalesce()
         return new_adj
@@ -132,7 +146,7 @@ class DenoisingNet(nn.Module):
     def __init__(self, input_dim, hidden_dim):
         super(DenoisingNet, self).__init__()
         
-        # 对应 AdaGCL 的 nblayers 和 selflayers
+        # 对应 AdaGCL 的结构
         self.nblayers_0 = nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.ReLU(inplace=True))
         self.selflayers_0 = nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.ReLU(inplace=True))
         
@@ -155,7 +169,6 @@ class DenoisingNet(nn.Module):
 
         if training:
             debug_var = 1e-7
-            bias = 0.0
             # 随机噪声
             random_noise = torch.rand_like(log_alpha) + debug_var
             gate_inputs = torch.log(random_noise) - torch.log(1.0 - random_noise)
@@ -195,31 +208,28 @@ class DenoisingNet(nn.Module):
         mask = mask.squeeze()
         
         # 4. 构造去噪图 (Masked Values)
-        # 此时 adj_masked 还是非归一化的，直接用会有数值问题
         masked_values = adj._values() * mask
         
-        # --- 关键修改开始：稀疏对称归一化 (Symmetric Normalization) ---
+        # --- 稀疏对称归一化 (Symmetric Normalization) ---
         
-        # 步骤 A: 构造一个临时的 coalesced 稀疏矩阵用于计算度
-        # 必须先 coalesce，因为同索引的边权重需要累加，否则 rowsum 计算错误
+        # A: Coalesce 用于正确聚合重复索引（如果有）
         temp_adj = torch.sparse_coo_tensor(indices, masked_values, adj.shape, device=adj.device).coalesce()
         temp_indices = temp_adj._indices()
         temp_values = temp_adj._values()
         
-        # 步骤 B: 计算度 (Degree)
-        # sparse.sum() 返回的是 dense 的 degree 向量 (N,)
+        # B: 计算度 (Degree)
         rowsum = torch.sparse.sum(temp_adj, dim=1).to_dense() + 1e-10
         
-        # 步骤 C: 计算 D^-0.5
+        # C: 计算 D^-0.5
         d_inv_sqrt = torch.pow(rowsum, -0.5)
-        d_inv_sqrt[torch.isinf(d_inv_sqrt)] = 0.
+        # [AdaGCL Fix] 增加数值截断，防止梯度爆炸
+        d_inv_sqrt = torch.clamp(d_inv_sqrt, 0.0, 10.0) 
         
-        # 步骤 D: 应用归一化 v' = v * d_i^-0.5 * d_j^-0.5
-        # 利用广播机制直接对 values 进行操作，避免构建 dense 矩阵
+        # D: 应用归一化
         temp_row, temp_col = temp_indices[0], temp_indices[1]
         norm_values = temp_values * d_inv_sqrt[temp_row] * d_inv_sqrt[temp_col]
         
-        # 步骤 E: 构造最终的归一化稀疏图
+        # E: 构造最终的归一化稀疏图
         adj_den_norm = torch.sparse_coo_tensor(temp_indices, norm_values, adj.shape, device=adj.device)
         
         return adj_den_norm
@@ -228,22 +238,9 @@ class DenoisingNet(nn.Module):
 # 2. 融合与主模型 (AdaDCRN_VGAE)
 # ====================================================================
 
-# class DCRN_Fusion(nn.Module):
-#     def __init__(self, num_nodes, hidden_dim):
-#         super(DCRN_Fusion, self).__init__()
-#         self.a = nn.Parameter(torch.ones(num_nodes, hidden_dim) * 1.0)
-#         self.b = nn.Parameter(torch.ones(num_nodes, hidden_dim) * 0.01)
-#         self.alpha = nn.Parameter(torch.tensor(0.5))
-
-#     def forward(self, z1, z2, adj):
-#         z_i = self.a * z1 + self.b * z2
-#         z_l = torch.spmm(adj, z_i)
-#         z_fused = self.alpha * z_l + (1 - self.alpha) * z_i
-#         return z_fused
 class AttentionFusion(nn.Module):
     def __init__(self, input_dim):
         super(AttentionFusion, self).__init__()
-        # 初始化时使用较小权重，避免生成视图主导
         self.att = nn.Sequential(
             nn.Linear(input_dim, 32),
             nn.Tanh(),
@@ -251,84 +248,105 @@ class AttentionFusion(nn.Module):
         )
         # 初始化第二层权重使得初始注意力较为平衡
         with torch.no_grad():
-            self.att[2].weight.fill_(0.0)  # 平衡初始化
-        self.temperature = 0.5 # 平衡温度，让生成和去噪视图都有贡献
+            self.att[2].weight.fill_(0.0)
+        self.temperature = 0.50 
 
     def forward(self, z_list):
+        # z_list: [z_gen, z_den] -> (N, 2, D)
         h = torch.stack(z_list, dim=1) 
-        att_score = self.att(h)
+        att_score = self.att(h) # (N, 2, 1)
         
-        # 使用温度系数平滑权重，防止初期崩塌到单一视图
+        # Softmax over view dimension
         weights = F.softmax(att_score / self.temperature, dim=1) 
         
         z_global = torch.sum(h * weights, dim=1)
         return z_global, weights
+
 class AdaDCRN_VGAE(nn.Module):
-    def __init__(self, num_nodes, input_dim, hidden_dim, num_clusters, gae_dims):
+    def __init__(self, num_nodes, input_dim, hidden_dim, num_clusters, gae_dims, use_cluster_proj=False):
         super(AdaDCRN_VGAE, self).__init__()
         
-        # 注入参数到全局 args，让 AdaGCL 组件能读取
+        # 注入参数到全局 args
         global args
-        args.user = num_nodes # DBLP 节点数映射为 User 数
-        args.item = 0         # 没有 Item
+        args.user = num_nodes
         args.latdim = hidden_dim
-        args.gnn_layer = 2
         
         z_dim = gae_dims[-1]
-        # === 核心组件实例化 ===
         
-        # 1. 生成视图 (VGAE)
+        # === 核心组件 ===
+        
+        # 1. 生成视图 (VGAE) - 使用 Inner Product Decoder
         self.encoder_vgae = vgae_encoder(input_dim, hidden_dim, z_dim)
-        self.decoder_vgae = vgae_decoder(z_dim)
+        self.decoder_vgae = vgae_decoder() # 无参数
         self.view_gen = vgae(self.encoder_vgae, self.decoder_vgae)
         
         # 2. 去噪视图 (AdaGCL DenoisingNet)
-        # 这里用 hidden_dim 作为内部维度
         self.view_den = DenoisingNet(input_dim, hidden_dim)
         
         # 3. 融合层
         self.fusion = AttentionFusion(z_dim)
         
-        # 4. 聚类头
+        # 4. 聚类投影与预测头
+        self.use_cluster_proj = use_cluster_proj
+        if self.use_cluster_proj:
+            self.cluster_proj = nn.Sequential(
+                nn.Linear(z_dim, z_dim),
+                nn.PReLU(),
+                nn.Linear(z_dim, z_dim)
+            )
+        else:
+            self.cluster_proj = nn.Identity()
+            
         self.head = nn.Linear(z_dim, num_clusters)
+        
+        # 5. 去噪视图的辅助重构解码器
+        self.den_decoder = nn.Sequential(
+            nn.Linear(z_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, input_dim)
+        )
 
     def forward(self, x, adj):
         # A. 生成视图流 (Generative View)
-        # 1. 生成增强图 (Augmented Graph)
-        # 注意: generate 会调用 encoder 和 decoder 来采样边
-        # adj_gen = self.view_gen.generate(x, adj) 
-        # 为了效率和梯度流，我们直接用 encoder 得到的 z_gen，不需要显式构建 adj_gen 再 encode 一遍
-        # 除非是为了做 GraphCL 对比。这里我们直接取 VGAE 的 Latent Z 作为 View 1 的特征
+        # 获取 z_gen, 用于训练重构 loss
         z_gen, adj_logits, mu, logstd = self.view_gen(x, adj)
         
         # B. 去噪视图流 (Denoising View)
-        # 1. 学习去噪掩码并生成去噪图 (Learnable Mask)
-        adj_den = self.view_den.generate(x,adj,training=self.training)
+        # 1. 学习去噪并生成图
+        adj_den = self.view_den.generate(x, adj, training=self.training)
         
-        # 2. 计算 L0 Regularization Loss (用于稀疏化)
+        # 2. L0 Loss
         l0_loss = self.view_den.l0_norm(self.view_den.edge_weights[0])
         
-        # 3. 编码去噪图
-        # 复用 view_gen 的 encoder (Shared Encoder 策略)
+        # 3. 编码去噪图 (共享/复用 VGAE Encoder)
         z_den, _, _ = self.view_gen.encoder(x, adj_den)
         
         # C. 融合 (Fusion)
         z_fused, weights = self.fusion([z_gen, z_den])
         
-        # D. 聚类输出 (En-CLU)
-        q_fused = F.softmax(self.head(z_fused), dim=1)
-        q_gen   = F.softmax(self.head(z_gen), dim=1)
-        q_den   = F.softmax(self.head(z_den), dim=1)
+        # D. 聚类输出
+        z_fused_proj = self.cluster_proj(z_fused)
+        z_gen_proj = self.cluster_proj(z_gen)
+        z_den_proj = self.cluster_proj(z_den)
         
+        q_fused = F.softmax(self.head(z_fused_proj), dim=1)
+        q_gen   = F.softmax(self.head(z_gen_proj), dim=1)
+        q_den   = F.softmax(self.head(z_den_proj), dim=1)
+        
+        # 辅助重构 (如果需要对 z_den 做特征重构监督)
+        recon_den = self.den_decoder(z_den)
+
         return {
             "q": q_fused,
             "q_gen": q_gen,
             "q_den": q_den,
-            "adj_logits": adj_logits, # 重构 Loss 用
+            "adj_logits": adj_logits, # 对应 VGAE 的重构目标
             "z_fused": z_fused,
-            "mu": mu,                 # VGAE KL Loss 用
+            "mu": mu,                 # 对应 VGAE 的 KL 目标
             "logstd": logstd,
-            "l0_loss": l0_loss,       # 加入总 Loss
+            "l0_loss": l0_loss,
             "z_den": z_den,
-            "att_weights": weights
+            "att_weights": weights,
+            "recon_den": recon_den,
+            "feat": x
         }

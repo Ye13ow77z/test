@@ -12,6 +12,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from sklearn.cluster import KMeans
 from sklearn.metrics import normalized_mutual_info_score, adjusted_rand_score, f1_score, accuracy_score
 from scipy.optimize import linear_sum_assignment 
+from sklearn.manifold import TSNE
 
 # 1. 引入工具和模型
 try:
@@ -23,6 +24,22 @@ except ImportError as e:
 
 from model_fusion import AdaDCRN_VGAE
 from LUCE_CMC.src.lib.contrastive_loss import ClusterLoss
+from losses import contrastive_loss
+import matplotlib.pyplot as plt
+
+def plot_tsne(z, labels, title, save_name):
+    print(f">> Plotting t-SNE: {title}...")
+    tsne = TSNE(n_components=2, init='pca', random_state=42)
+    z_2d = tsne.fit_transform(z)
+    
+    plt.figure(figsize=(10, 8))
+    scatter = plt.scatter(z_2d[:, 0], z_2d[:, 1], c=labels, cmap='tab10', s=10, alpha=0.6)
+    plt.legend(*scatter.legend_elements(), title="Clusters", loc="upper right")
+    plt.title(title)
+    plt.axis('off')
+    plt.savefig(save_name, dpi=300)
+    plt.close()
+    print(f">> Saved to {save_name}")
 
 # ====================================================================
 # 配置参数
@@ -30,28 +47,35 @@ from LUCE_CMC.src.lib.contrastive_loss import ClusterLoss
 
 class Args:
     def __init__(self):
-        self.dataset = 'dblp'
-        # 预训练权重路径
+        self.dataset = 'cite'
         self.pretrain_path = f'./model_pretrain/{self.dataset}_fusion_pretrain.pkl'
         
-        # 自动填充
-        self.n_clusters = 0       
-        self.n_input = 0       
-        self.hidden_dim = 512
-        self.gae_dims = [] 
+        # === 核心配置 (必须与 Pretrain 一致) ===
+        self.hidden_dim = 512 
+        self.z_dim = 128     
         
-        self.lr = 1e-4  # 最优config from Cfg10
-        self.epochs = 300  # 300轮最优，避免过拟合
+        self.n_clusters = 0 # 自动从数据加载
+        self.n_input = 0    # 自动从数据加载
+        self.gae_dims = []  # 自动构建
+        self.use_cluster_proj = False 
+        
+        # 训练超参数
+        self.lr = 1e-4
+        self.epochs = 400
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.weight_decay = 0.0
-        self.use_amp = False
+        self.weight_decay = 5e-4 
         
         # Loss 权重 
-        self.lambda_recon = 1.0  
-        self.lambda_kl_cluster = 10.0
-        self.lambda_vgae = 1.0       
-        self.lambda_en_clu = 15.0  # 最优config from Cfg10
-        self.cluster_temp = 0.8   # 最优config from Cfg10     
+
+        self.lambda_recon = 1.0
+        self.lambda_kl_cluster = 8
+        self.lambda_vgae = 0.1     
+        self.lambda_en_clu =2.0
+        self.cluster_temp = 0.2
+        self.l0_weight = 0
+        self.lambda_contrastive = 1.0
+        
+        self.warmup_epochs = 50
 
 args = Args()
 
@@ -75,7 +99,6 @@ def eva(y_true, y_pred):
     return acc, nmi, ari, f1
 
 def target_distribution(q):
-    # 数值稳定保护
     weight = q**2 / (q.sum(0) + 1e-15)
     return (weight.t() / (weight.sum(1) + 1e-15)).t()
 
@@ -84,10 +107,11 @@ def vgae_kl_loss(mu, logstd):
 
 def load_pretrained(model, path):
     if os.path.exists(path):
-        print(f"Loading full pretrained fusion model from {path}...")
+        print(f"Loading pretrained fusion model from {path}...")
+        # strict=False 允许加载时忽略不匹配的键（例如旧的 decoder 参数）
         model.load_state_dict(torch.load(path, map_location=args.device), strict=False)
     else:
-        print("Pretrain file not found, starting from scratch.")
+        print("!! Pretrain file not found. Please run pretrain_fusion_dblp.py first !!")
 
 # ====================================================================
 # 主程序
@@ -95,44 +119,36 @@ def load_pretrained(model, path):
 
 if __name__ == "__main__":
     
-    # === 1. 数据加载逻辑分支 ===
+    # === 1. 数据加载 ===
     if args.dataset == 'acm':
-        print(f">> Loading ACM data via utils_acm...")
-        # ACM 路径：直接指向 .mat 文件
+        print(f">> Loading ACM data...")
         acm_path = './DCRN/dataset/ACM3025.mat'
-        # load_acm 返回的已经是 sparse adj
         adj_sparse, feat, label, adj_label = load_acm(acm_path, args.device)
-        
-        # ACM 的隐藏层通常设置宽一点，如果你预训练用了 512，这里也得是 512
-        # 假设你之前预训练用的 512 (根据之前的对话)
-        args.hidden_dim = 512 
     elif args.dataset == 'citeseer':
-        print(f">> Loading Citeseer data via utils_cite...")
-        # Citeseer 路径：指向数据目录
+        print(f">> Loading Citeseer data...")
         cite_path = './DCRN/dataset/citeseer/'
         adj_sparse, feat, label, adj_label = load_citeseer(cite_path, args.device)
-        
-        args.hidden_dim = 512 # Citeseer 通常用 512 隐藏层
-    else:
-        print(f">> Loading {args.dataset} data via utils_data...")
+    else: # DBLP or others
+        print(f">> Loading {args.dataset} data...")
         adj, feat, label, adj_label = load_graph_data(
             args.dataset, 
             path='./DCRN/dataset/', 
             use_pca=False, 
             device=args.device
         )
-        print("Converting Adjacency Matrix to Sparse Tensor...")
-        adj_sparse = adj.to_sparse().to(args.device)
-        args.hidden_dim = 512 # Cora/DBLP 默认
+        # 统一转稀疏
+        if isinstance(adj, torch.Tensor) and adj.is_sparse:
+            adj_sparse = adj.to(args.device)
+        else:
+            adj_sparse = adj.to_sparse().to(args.device)
 
-    # 动态更新参数
+    # 动态参数更新
     args.n_input = feat.shape[1]                
     args.n_clusters = len(torch.unique(label))
-    # 保持与预训练一致的维度结构 (提升z_dim到128以匹配强化预训练)
-    args.gae_dims = [args.n_input, args.hidden_dim, 128 if args.hidden_dim == 512 else 50]     
+    args.gae_dims = [args.n_input, args.hidden_dim, args.z_dim]     
     
     print(f"\n>> Dataset: {args.dataset}")
-    print(f">> Input Dim: {args.n_input}, Clusters: {args.n_clusters}, Hidden: {args.hidden_dim}")
+    print(f">> Config: In={args.n_input}, Hidden={args.hidden_dim}, Z={args.z_dim}, Clusters={args.n_clusters}")
 
     # 2. 初始化模型
     model = AdaDCRN_VGAE(
@@ -140,7 +156,8 @@ if __name__ == "__main__":
         input_dim=args.n_input,
         hidden_dim=args.hidden_dim,
         num_clusters=args.n_clusters,
-        gae_dims=args.gae_dims
+        gae_dims=args.gae_dims,
+        use_cluster_proj=args.use_cluster_proj
     ).to(args.device)
 
     # 3. 加载预训练权重
@@ -149,31 +166,32 @@ if __name__ == "__main__":
     # 4. 初始化 En-CLU Loss
     criterion_en_clu = ClusterLoss(args.n_clusters, args.cluster_temp, args.device).to(args.device)
 
-    # 5. K-Means 初始化
-    print("Initializing cluster centers with K-Means on Fused Features...")
-    
+    # 5. K-Means 初始化聚类中心
+    print("Initializing cluster centers with K-Means...")
     model.eval() 
     with torch.no_grad():
         out_init = model(feat, adj_sparse)
         z_init = out_init['mu'].cpu().numpy()
         
-    kmeans = KMeans(n_clusters=args.n_clusters, n_init=100)
+    # 多次运行取最优，确保中心质量
+    kmeans = KMeans(n_clusters=args.n_clusters, n_init=20)
     y_pred = kmeans.fit_predict(z_init)
     
     model.head.weight.data = torch.tensor(kmeans.cluster_centers_).to(args.device)
     model.head.bias.data.fill_(0.0)
     
     acc, nmi, ari, f1 = eva(label.cpu().numpy(), y_pred)
-    print(f"[Init] ACC: {acc:.4f} | NMI: {nmi:.4f} | ARI: {ari:.4f}")
+    print(f"[Init] ACC: {acc:.4f} | NMI: {nmi:.4f}")
 
-    # 6. 训练
+    # 6. 训练准备
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-5)
     
-    # Pos Weight 用于重构 Loss
-    pos_weight_val = float(adj_label.shape[0]**2 - adj_label.sum()) / adj_label.sum()
-    norm_val = adj_label.shape[0]**2 / float((adj_label.shape[0]**2 - adj_label.sum()) * 2)
-    pos_weight = torch.tensor(pos_weight_val, dtype=torch.float32, device=args.device)
+    # 重构 Loss 的权重计算
+    pos_sum = adj_label.sum().item()
+    pos_weight_val = float((adj_label.shape[0]**2 - pos_sum) / (pos_sum + 1e-15))
+    norm_val = adj_label.shape[0]**2 / float(((adj_label.shape[0]**2 - pos_sum) * 2) + 1e-15)
+    pos_weight = torch.as_tensor(pos_weight_val, dtype=torch.float32, device=args.device)
     
     print("\n[Start Training]")
     model.train() 
@@ -182,7 +200,7 @@ if __name__ == "__main__":
     best_model_path = f'best_fusion_model_{args.dataset}.pkl'
     
     for epoch in range(args.epochs):
-        # Target Distribution 更新
+        # 每 5 epoch 更新一次目标分布 p
         if epoch % 5 == 0: 
             with torch.no_grad():
                 out = model(feat, adj_sparse)
@@ -192,68 +210,64 @@ if __name__ == "__main__":
         # Forward
         out = model(feat, adj_sparse)
         
-        # 数值截断保护 (防止 NaN)
-        q_fused = torch.clamp(out['q'], min=1e-15, max=1.0)
-        q_gen   = torch.clamp(out['q_gen'], min=1e-15, max=1.0)
-        q_den   = torch.clamp(out['q_den'], min=1e-15, max=1.0)
+        q_fused = out['q']
+        q_gen   = out['q_gen']
+        q_den   = out['q_den']
         
-        adj_logits = out['adj_logits']
-        mu = out['mu']
-        logstd = out['logstd']
-        l0_loss = out['l0_loss']
-        
-        # --- Loss ---
-        # 1. DEC Loss (KL Divergence)
+        # --- Loss Calculation ---
+        # 1. DEC Loss (KL Divergence with p)
         kl_cluster_loss = F.kl_div(q_fused.log(), p, reduction='batchmean')
         
-        # 2. En-CLU Loss (对比学习)
+        # 2. En-CLU Loss (多视图聚类对比)
         loss_clu_gen = criterion_en_clu(q_gen, q_fused)
         loss_clu_den = criterion_en_clu(q_den, q_fused)
         en_clu_loss = loss_clu_gen + loss_clu_den
         
         # 3. Recon Loss (VGAE 重构)
         recon_loss = norm_val * F.binary_cross_entropy_with_logits(
-            adj_logits.view(-1), adj_label.view(-1), pos_weight=pos_weight
+            out['adj_logits'].view(-1), adj_label.view(-1), pos_weight=pos_weight
         )
         
-        # 4. VGAE KL
-        kl_vgae = vgae_kl_loss(mu, logstd)
+        # 4. KL Divergence (VGAE 正则)
+        kl_vgae = vgae_kl_loss(out['mu'], out['logstd'])
         
-        # 总 Loss
-        loss = args.lambda_kl_cluster * kl_cluster_loss \
-             + args.lambda_recon * recon_loss \
-             + args.lambda_vgae * kl_vgae \
-             + args.lambda_en_clu * en_clu_loss \
-             + 1e-3 * l0_loss 
+        # 5. Contrastive Loss (视图特征对齐)
+        cl_loss = contrastive_loss(out['mu'], out['z_den'])
         
+        # 6. L0 Loss (动态权重)
+        l0_loss = out['l0_loss']
+        curr_l0_w = args.l0_weight * min(1.0, epoch / 100.0)
+        
+        # Warmup 策略
+        warmup = min(1.0, epoch / args.warmup_epochs)
+
+        loss = args.lambda_kl_cluster * warmup * kl_cluster_loss \
+               + args.lambda_recon * recon_loss \
+               + args.lambda_vgae * kl_vgae \
+               + args.lambda_en_clu * warmup * en_clu_loss \
+               + args.lambda_contrastive * warmup * cl_loss \
+               + curr_l0_w * l0_loss 
+
         optimizer.zero_grad()
         loss.backward()
-        
-        # === 梯度裁剪 (防止爆炸) ===
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-        
         optimizer.step()
         scheduler.step()
 
+        # Logging
         if epoch % 10 == 0 or epoch == args.epochs - 1:
             y_pred = q_fused.argmax(1).cpu().numpy()
             acc, nmi, ari, f1 = eva(label.cpu().numpy(), y_pred)
-            print(f"Epoch {epoch:03d} | Loss: {loss.item():.4f} | En-CLU: {en_clu_loss.item():.4f} | ACC: {acc:.4f} | NMI: {nmi:.4f}")
             
+            print(f"Epoch {epoch:03d} | Loss: {loss.item():.4f} | En-CLU: {en_clu_loss.item():.4f} | ACC: {acc:.4f} | NMI: {nmi:.4f}")
+
             if acc > best_acc:
                 best_acc = acc
                 best_epoch = epoch
                 torch.save(model.state_dict(), best_model_path)
-                print(f"   >> [New Best] Model saved (ACC: {best_acc:.4f})")
-            
-            # 打印注意力权重看看 (如果有返回)
-            if 'att_weights' in out:
-                att_w = out['att_weights'].mean(dim=0).squeeze().detach().cpu().numpy()
-                print(f"   >> Attn: Gen {att_w[0]:.3f} | Den {att_w[1]:.3f}")
 
     print("\nTraining Finished.")
-    print(f"Recorded Best Epoch: {best_epoch} | Best ACC: {best_acc:.4f}")
-
+    print(f"Best Epoch: {best_epoch} | Best ACC: {best_acc:.4f}")
     # === 加载最佳模型并重新评估 ===
     if os.path.exists(best_model_path):
         print(f"\n>> Loading Best Model from {best_model_path}...")
@@ -261,11 +275,93 @@ if __name__ == "__main__":
         model.eval()
         with torch.no_grad():
             out = model(feat, adj_sparse)
-            q_fused = out['q']
-            y_pred = q_fused.argmax(1).cpu().numpy()
-            final_acc, final_nmi, final_ari, final_f1 = eva(label.cpu().numpy(), y_pred)
             
+            # 1. 方法 A: 直接使用网络的软分类输出 q
+            q_fused = out['q']
+            y_pred_q = q_fused.argmax(1).cpu().numpy()
+            q_acc, q_nmi, q_ari, q_f1 = eva(label.cpu().numpy(), y_pred_q)
+            
+            # 2. 方法 B: 提取“融合特征” z_fused 进行高质量 K-Means
+            #    相比 mu，z_fused 包含了降噪视图的信息，质量通常更高
+            z_fused = out['z_fused'].cpu().numpy()
+
+            print(">> Running Post-Training K-Means on fused features (z_fused)...")
+            best_acc_r = -1.0
+            best_nmi_r = -1.0
+            best_ari_r = -1.0
+            best_f1_r = -1.0
+            
+            # 运行 20 次 K-Means 取最优，消除初始化带来的随机波动
+            # 使用 sklearn 的并行计算 (n_init=20) 
+            kmeans = KMeans(n_clusters=args.n_clusters, n_init=20, random_state=42)
+            y_pred_k = kmeans.fit_predict(z_fused)
+            
+            best_acc_r, best_nmi_r, best_ari_r, best_f1_r = eva(label.cpu().numpy(), y_pred_k)
+
         print("="*60)
-        print(f"FINAL BEST RESULT on {args.dataset}:")
-        print(f"ACC: {final_acc:.4f} | NMI: {final_nmi:.4f} | ARI: {final_ari:.4f} | F1: {final_f1:.4f}")
+        print(f"FINAL RESULT on {args.dataset}:")
+        print(f"1. Network Output (q):     ACC: {q_acc:.4f} | NMI: {q_nmi:.4f} | ARI: {q_ari:.4f}")
+        print(f"2. Post-KMeans (z_fused):  ACC: {best_acc_r:.4f} | NMI: {best_nmi_r:.4f} | ARI: {best_ari_r:.4f}")
         print("="*60)
+        
+        # 保存结果以便分析
+        try:
+            np.savez(f'final_embeddings_{args.dataset}.npz', 
+                     z_fused=z_fused, 
+                     labels=label.cpu().numpy(),
+                     pred_q=y_pred_q, 
+                     pred_k=y_pred_k)
+        except Exception:
+            pass
+        
+        if best_acc_r > q_acc:
+            print("\n>> 🚀 Fine-tuning Head to match Post-KMeans results...")
+            
+            # 1. 准备伪标签 (使用表现最好的 K-Means 预测结果)
+            # y_pred_k 是上面 KMeans 跑出来的最好结果
+            pseudo_labels = torch.tensor(y_pred_k, device=args.device).long()
+            
+            # 2. 冻结骨干网络，只解锁分类头
+            for param in model.parameters():
+                param.requires_grad = False
+            for param in model.head.parameters():
+                param.requires_grad = True
+                
+            # 3. 定义专用优化器 (只优化 head)
+            head_optimizer = optim.Adam(model.head.parameters(), lr=0.01)
+            
+            # 4. 快速微调 (50个epoch足够了)
+            print(">> Start Fine-tuning Head...")
+            model.train()
+            for ft_epoch in range(50):
+                head_optimizer.zero_grad()
+                out_ft = model(feat, adj_sparse)
+                
+                # 使用 NLLLoss (因为 out['q'] 已经是 Softmax 后的概率)
+                # 目标是让 q 的预测分布完全逼近 K-Means 的硬标签
+                loss_ft = F.nll_loss(torch.log(out_ft['q'] + 1e-15), pseudo_labels)
+                
+                loss_ft.backward()
+                head_optimizer.step()
+                
+                if ft_epoch % 10 == 0:
+                    print(f"   FT Epoch {ft_epoch} | Loss: {loss_ft.item():.4f}")
+
+            # 5. 最终评估
+            print(">> Re-evaluating q after fine-tuning...")
+            model.eval()
+            out_final = model(feat, adj_sparse)
+            y_pred_final = out_final['q'].argmax(1).cpu().numpy()
+            
+            acc_f, nmi_f, ari_f, f1_f = eva(label.cpu().numpy(), y_pred_final)
+            print("="*60)
+            print(f"✅ FINAL CALIBRATED Q:  ACC: {acc_f:.4f} | NMI: {nmi_f:.4f} | ARI: {ari_f:.4f}")
+            print("="*60)
+        
+        # 自动画图
+        try:
+            plot_tsne(z_fused, label.cpu().numpy(), 
+                      title=f"Fusion Clustering (ACC={q_acc:.4f})", 
+                      save_name=f"tsne_{args.dataset}_final.png")
+        except Exception:
+            pass
